@@ -6,6 +6,7 @@
 package io.opentelemetry.android
 
 import io.mockk.Called
+import io.mockk.any
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -81,6 +82,9 @@ class CrashFlushHandlerTest {
 
     @Test
     fun `does not throw when flush fails`() {
+        val existingHandler = mockk<Thread.UncaughtExceptionHandler>(relaxed = true)
+        Thread.setDefaultUncaughtExceptionHandler(existingHandler)
+
         val tracerProvider = mockk<SdkTracerProvider>()
         val loggerProvider = mockk<SdkLoggerProvider>()
         val meterProvider = mockk<SdkMeterProvider>()
@@ -91,15 +95,18 @@ class CrashFlushHandlerTest {
         CrashFlushHandler(sdk).install()
 
         val handler = Thread.getDefaultUncaughtExceptionHandler()!!
-        handler.uncaughtException(Thread.currentThread(), RuntimeException("test"))
+        val thread = Thread.currentThread()
+        val exception = RuntimeException("test")
+        handler.uncaughtException(thread, exception)
 
         verify { loggerProvider.forceFlush() }
         verify { tracerProvider wasNot Called }
         verify { meterProvider wasNot Called }
+        verify { existingHandler.uncaughtException(thread, exception) }
     }
 
     @Test
-    fun `previous handler runs before flush`() {
+    fun `flushes before delegating to previous handler`() {
         val existingHandler = mockk<Thread.UncaughtExceptionHandler>(relaxed = true)
         Thread.setDefaultUncaughtExceptionHandler(existingHandler)
 
@@ -119,9 +126,43 @@ class CrashFlushHandlerTest {
         handler.uncaughtException(thread, RuntimeException("test"))
 
         verifyOrder {
-            existingHandler.uncaughtException(thread, any())
             tracerProvider.forceFlush()
+            existingHandler.uncaughtException(thread, any())
         }
+    }
+
+    @Test
+    fun `flush includes work done by a handler that wraps this one`() {
+        val order = mutableListOf<String>()
+        val originalHandler = Thread.UncaughtExceptionHandler { _, _ -> order.add("previous") }
+        Thread.setDefaultUncaughtExceptionHandler(originalHandler)
+
+        val tracerProvider = mockk<SdkTracerProvider>()
+        val loggerProvider = mockk<SdkLoggerProvider>()
+        val meterProvider = mockk<SdkMeterProvider>()
+        val sdk = mockSdk(tracerProvider, loggerProvider, meterProvider)
+
+        every { loggerProvider.forceFlush() } returns CompletableResultCode.ofSuccess()
+        every { tracerProvider.forceFlush() } answers {
+            order.add("flush")
+            CompletableResultCode.ofSuccess()
+        }
+        every { meterProvider.forceFlush() } returns CompletableResultCode.ofSuccess()
+
+        CrashFlushHandler(sdk).install()
+        val flushHandler = Thread.getDefaultUncaughtExceptionHandler()!!
+
+        // Crash instrumentation installs after CrashFlushHandler and wraps it,
+        // emitting the crash event before delegating (which then flushes).
+        val wrappingHandler =
+            Thread.UncaughtExceptionHandler { thread, throwable ->
+                order.add("crash-reporter")
+                flushHandler.uncaughtException(thread, throwable)
+            }
+
+        wrappingHandler.uncaughtException(Thread.currentThread(), RuntimeException("test"))
+
+        assertThat(order).containsExactly("crash-reporter", "flush", "previous")
     }
 
     private fun mockSdk(
